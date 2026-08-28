@@ -20,6 +20,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.stretch_policy as stretch_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -347,6 +348,63 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
         model_transforms = ModelTransformFactory()(model_config)
 
         # We return all data transforms for training and inference. No need to change anything here.
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotStretchDataConfig(DataConfigFactory):
+    """Data pipeline for the Stretch 4 dataset recorded with the on-robot recorder GUI.
+
+    Schema v2 (2026-08-21):
+      action (8) = [base_dx, base_dy, base_dtheta, lift, arm, wrist_yaw,
+                    wrist_pitch, grip_bit]
+      The recorder stores the joint pose LOOKAHEAD=5 frames (500 ms) ahead, base
+      motion as a delta in the base frame at time t, and a BINARY gripper.
+      mask (-3, 4, -1): base stays absolute (it is already frame-relative, and
+      differencing it against the zero padding would be a no-op anyway), the 4
+      joint dims become deltas, the gripper bit stays absolute.
+    """
+
+    # Set False to train on absolute joint positions instead of deltas.
+    # Decide BEFORE computing norm stats; changing it invalidates them.
+    delta_joint_actions: bool = True
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": "observation.images.head_center",
+                        "observation/wrist_image": "observation.images.gripper",
+                        "observation/state": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[stretch_policy.StretchInputs(model_type=model_config.model_type)],
+            outputs=[stretch_policy.StretchOutputs()],
+        )
+
+        if self.delta_joint_actions:
+            delta_action_mask = _transforms.make_bool_mask(-3, 4, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory()(model_config)
+
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
             repack_transforms=repack_transform,
@@ -760,6 +818,42 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
         num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_stretch",
+        # LoRA fine-tune
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotStretchDataConfig(
+            repo_id="olagh/stretch4_red_block",
+            base_config=DataConfig(prompt_from_task=True, action_sequence_keys=("action",)),
+        ),
+       
+        batch_size=32,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        # Freeze everything except the LoRA adapter weights.
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        # EMA off for LoRA fine-tuning (openpi convention).
+        ema_decay=None,
     ),
     #
     # Fine-tuning Aloha configs.

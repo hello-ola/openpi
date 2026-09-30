@@ -26,6 +26,7 @@ import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
 import openpi.training.misc.polaris_config as polaris_config
 import openpi.training.misc.roboarena_config as roboarena_config
+import openpi.training.misc.stretch4_config as stretch4_config
 import openpi.training.optimizer as _optimizer
 import openpi.training.weight_loaders as weight_loaders
 import openpi.transforms as _transforms
@@ -357,57 +358,155 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
 
 
 
-@dataclasses.dataclass(frozen=True)
-class LeRobotStretchDataConfig(DataConfigFactory):
-    """Data pipeline for the Stretch 4 dataset recorded with the on-robot recorder GUI.
+def stretch4_dataset_head_cameras(repo_id: str | None) -> tuple[str, ...] | None:
+    """The head cameras a local Stretch 4 dataset has (head_left before head_right), or None
+    if the dataset is not in the local LeRobot cache."""
+    if not repo_id:
+        return None
+    import json
 
-    Schema v2 (2026-08-21):
-      action (8) = [base_dx, base_dy, base_dtheta, lift, arm, wrist_yaw,
-                    wrist_pitch, grip_bit]
-      The recorder stores the joint pose LOOKAHEAD=5 frames (500 ms) ahead, base
-      motion as a delta in the base frame at time t, and a BINARY gripper.
-      mask (-3, 4, -1): base stays absolute (it is already frame-relative, and
-      differencing it against the zero padding would be a no-op anyway), the 4
-      joint dims become deltas, the gripper bit stays absolute.
+    from lerobot.common.constants import HF_LEROBOT_HOME
+
+    info = pathlib.Path(HF_LEROBOT_HOME) / repo_id / "meta" / "info.json"
+    if not info.exists():
+        return None
+    features = json.loads(info.read_text())["features"]
+    heads = tuple(n for n in ("head_left", "head_right", "head") if f"observation.images.{n}" in features)
+    if not heads:
+        raise ValueError(f"{repo_id} has no head camera column (observation.images.head_left/right)")
+    return heads
+
+
+# observation.state columns of a Stretch 4 dataset (stretch4_to_lerobot, schema v2).
+STRETCH4_STATE_NAMES = ["lift", "arm", "wrist_yaw", "wrist_pitch", "wrist_roll", "grip_mm",
+                        "base_vx", "base_vy", "base_omega"]
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotStretch4DataConfig(DataConfigFactory):
+    """Data pipeline for Stretch 4 datasets from stretch4_policy_recorder
+    (stretch4_to_lerobot --format v21).
+
+      observation.state (9)      lift, arm, wrist_yaw/pitch/roll, grip_mm, base_vx/vy/omega
+      observation.base_odom (3)  base_x, base_y, base_theta: the anchor for base="delta" only
+      action (9)                 targets K frames ahead: base displacement since episode start
+                                 (with --base-action velocity: body-frame vx, vy, omega), joint
+                                 positions, gripper aperture
+
+    base="delta": base targets are SE(2) poses relative to the robot's pose at the observation.
+        Needs a pose export. The robot client composes them onto its odometry.
+    base="velocity": base targets are body-frame velocities, used as-is. Needs a
+        --base-action velocity export; the base pose is not used at all.
+    The model never sees the base pose. Arm and wrist joints are relative to the state at the
+    observation; the gripper is absolute unless gripper="relative". See
+    stretch_policy.StretchRelativeActions / StretchAbsoluteActions.
+
+    Configs are built from configs/stretch4.yaml (training/misc/stretch4_config.py), which
+    also sets policy_metadata so the robot client knows how to decode the base.
     """
 
-    # Set False to train on absolute joint positions instead of deltas.
-    # Decide BEFORE computing norm stats; changing it invalidates them.
-    delta_joint_actions: bool = True
+    # Head cameras, in slot order (the first feeds base_0_rgb, a second right_wrist_0_rgb).
+    # None: every head camera the dataset has (head_left before head_right).
+    head_cameras: tuple[str, ...] | None = None
+    base: str = "delta"
+    gripper: str = "absolute"
+    # Joints held still (stretch_policy.held_action_dims): any action dim whose q01..q99 range in
+    # the norm stats is below min_motion (m / rad / mm), plus hold_joints. 0 disables the automatic part.
+    min_motion: float = 1e-3
+    hold_joints: tuple[str, ...] = ()
+
+    def __post_init__(self):
+        stretch_policy._check_modes(self.base, self.gripper)
+
+    def resolved_head_cameras(self, repo_id: str | None) -> tuple[str, ...]:
+        """head_cameras, or the dataset's head cameras when it is None."""
+        found = stretch4_dataset_head_cameras(repo_id)
+        if self.head_cameras is None:
+            if found is None:
+                raise ValueError(f"{repo_id} is not in the local LeRobot cache, so its head cameras are "
+                                 "unknown; set head_cameras in configs/stretch4.yaml")
+            return found
+        heads = tuple(self.head_cameras)
+        if not 1 <= len(heads) <= 2:
+            raise ValueError(f"head_cameras must list one or two cameras, got {heads}")
+        if found is not None and not set(heads) <= set(found):
+            raise ValueError(f"head_cameras {heads}: {repo_id} only has {found}")
+        return heads
+
+    def _check_dataset(self, repo_id: str | None) -> None:
+        """Refuse a local dataset with the wrong layout or base representation."""
+        if not repo_id:
+            return
+        import json
+
+        from lerobot.common.constants import HF_LEROBOT_HOME
+
+        root = pathlib.Path(HF_LEROBOT_HOME) / repo_id
+        info_path = root / "meta" / "info.json"
+        if info_path.exists():
+            names = json.loads(info_path.read_text())["features"]["observation.state"].get("names")
+            if list(names or []) != STRETCH4_STATE_NAMES:
+                raise ValueError(
+                    f"{repo_id}: observation.state is {names}, expected {STRETCH4_STATE_NAMES} (no base "
+                    "pose). Re-convert it with the current stretch4_to_lerobot --format v21.")
+        conv = root / "stretch_conversion.json"
+        if conv.exists():
+            info = json.loads(conv.read_text())
+            exported = info.get("base_action", "pose")
+            wanted = "velocity" if self.base == "velocity" else "pose"
+            if exported != wanted:
+                raise ValueError(
+                    f"{repo_id} was exported with --base-action {exported}, but this config trains "
+                    f"base={self.base!r}, which needs --base-action {wanted}.")
+            if info.get("action_mode", "absolute") != "absolute":
+                raise ValueError(f"{repo_id} was exported with --relative-actions; re-export without it.")
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
-        repack_transform = _transforms.Group(
-            inputs=[
-                _transforms.RepackTransform(
-                    {
-                        "observation/image": "observation.images.head_center",
-                        "observation/wrist_image": "observation.images.gripper",
-                        "observation/state": "observation.state",
-                        "actions": "action",
-                        "prompt": "prompt",
-                    }
-                )
-            ]
-        )
+        base_config = self.create_base_config(assets_dirs, model_config)
+        self._check_dataset(base_config.repo_id)
+        heads = self.resolved_head_cameras(base_config.repo_id)
+        repack = {
+            "observation/image": f"observation.images.{heads[0]}",
+            "observation/wrist_image": "observation.images.gripper",
+            "observation/state": "observation.state",
+            "actions": "action",
+            "prompt": "prompt",
+        }
+        if len(heads) == 2:
+            repack["observation/image2"] = f"observation.images.{heads[1]}"
+        if self.base == "delta":
+            repack["observation/base_pose"] = "observation.base_odom"
+
+        # No norm stats yet (compute_norm_stats.py's first run): nothing to decide from, and the
+        # stats themselves are computed before any hold is applied.
+        held, reasons = stretch_policy.held_action_dims(base_config.norm_stats, self.min_motion,
+                                                        self.hold_joints)
+        for dim in held:
+            logging.info("Stretch 4: holding %s (%s)", stretch_policy.ACTION_NAMES[dim], reasons[dim])
 
         data_transforms = _transforms.Group(
-            inputs=[stretch_policy.StretchInputs(model_type=model_config.model_type)],
-            outputs=[stretch_policy.StretchOutputs()],
+            inputs=[
+                stretch_policy.StretchInputs(model_type=model_config.model_type),
+                stretch_policy.StretchRelativeActions(base=self.base, gripper=self.gripper),
+            ],
+            outputs=[
+                stretch_policy.StretchAbsoluteActions(gripper=self.gripper, held=held),
+                stretch_policy.StretchOutputs(action_dim=9, held=held),
+            ],
         )
 
-        if self.delta_joint_actions:
-            delta_action_mask = _transforms.make_bool_mask(-3, 4, -1)
-            data_transforms = data_transforms.push(
-                inputs=[_transforms.DeltaActions(delta_action_mask)],
-                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+        model_transforms = ModelTransformFactory()(model_config)
+        if held:
+            # First after Normalize, before padding to the model's width.
+            model_transforms = _transforms.Group(
+                inputs=[stretch_policy.StretchHoldJoints(action_dims=held), *model_transforms.inputs],
+                outputs=model_transforms.outputs,
             )
 
-        model_transforms = ModelTransformFactory()(model_config)
-
         return dataclasses.replace(
-            self.create_base_config(assets_dirs, model_config),
-            repack_transforms=repack_transform,
+            base_config,
+            repack_transforms=_transforms.Group(inputs=[_transforms.RepackTransform(repack)]),
             data_transforms=data_transforms,
             model_transforms=model_transforms,
         )
@@ -819,42 +918,6 @@ _CONFIGS = [
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
         num_train_steps=30_000,
     ),
-    TrainConfig(
-        name="pi05_stretch",
-        # LoRA fine-tune
-        model=pi0_config.Pi0Config(
-            pi05=True,
-            action_horizon=10,
-            discrete_state_input=False,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ),
-        data=LeRobotStretchDataConfig(
-            repo_id="olagh/stretch4_red_block",
-            base_config=DataConfig(prompt_from_task=True, action_sequence_keys=("action",)),
-        ),
-       
-        batch_size=32,
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1_000,
-            peak_lr=5e-5,
-            decay_steps=30_000,
-            decay_lr=5e-6,
-        ),
-        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        num_train_steps=30_000,
-        # Freeze everything except the LoRA adapter weights.
-        freeze_filter=pi0_config.Pi0Config(
-            pi05=True,
-            action_horizon=10,
-            discrete_state_input=False,
-            paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
-        ).get_freeze_filter(),
-        # EMA off for LoRA fine-tuning (openpi convention).
-        ema_decay=None,
-    ),
     #
     # Fine-tuning Aloha configs.
     #
@@ -1062,6 +1125,8 @@ _CONFIGS = [
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),
     *polaris_config.get_polaris_configs(),
+    # Stretch 4 fine-tuning experiments, defined in configs/stretch4.yaml.
+    *stretch4_config.get_stretch4_configs(),
 ]
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):

@@ -1,0 +1,54 @@
+# Stretch 4 π0.5 fine-tuning experiments.
+#
+# Each entry under `experiments:` is an openpi config name:
+#   .venv/bin/python scripts/compute_norm_stats.py --config-name <name>
+#   .venv/bin/python scripts/train.py <name> --exp-name=run1 --overwrite
+#   .venv/bin/python scripts/serve_policy.py policy:checkpoint --policy.config=<name> --policy.dir=...
+#
+# Name them pi05_stretch4_<task>_<base>. Anything not set here comes from `defaults:`.
+#
+#   repo_id          LeRobot v2.1 dataset (stretch4_to_lerobot --format v21)
+#   base             delta    : base targets are SE(2) poses relative to the robot's pose now
+#                               (needs a normal export)
+#                    velocity : base targets are body-frame vx, vy, omega
+#                               (needs stretch4_to_lerobot --base-action velocity)
+#   gripper          absolute (recommended) | relative
+#   head_cameras     optional. Default: every head camera the dataset has (both eyes if it has
+#                    both). Or list them, in slot order: [head_left, head_right], [head_right]
+#   action_horizon   steps per chunk (30 = 1 s at 30 Hz)
+#   batch_size, num_train_steps, peak_lr, warmup_steps, decay_lr, save_interval, keep_period
+#   min_motion       default 0.001. Any action dim whose q01..q99 range in the norm stats is below
+#                    this (m / rad / mm) barely moved in the demos and is held still: the model
+#                    neither sees nor predicts it, and the robot keeps it where it is. Without this
+#                    a near-constant joint (wrist roll) normalizes to huge values and training
+#                    diverges. Training and serving log "Stretch 4: holding <joint>". 0 disables.
+#   hold_joints      joints to hold regardless, e.g. [wrist_roll]
+#
+# Changing base, gripper or action_horizon changes the training targets: recompute norm stats.
+
+defaults:
+  gripper: absolute
+  action_horizon: 30
+  batch_size: 32
+  num_train_steps: 20001
+  peak_lr: 5.0e-5
+  warmup_steps: 1000
+  decay_lr: 5.0e-6
+
+experiments:
+  pi05_stretch4_mouse_delta:
+    repo_id: olagh/stretch4_mouse_pickup_2
+    base: delta
+
+  pi05_stretch4_mouse_velocity:
+    repo_id: olagh/stretch4_mouse_pickup_2_vel
+    base: velocity
+
+  pi05_stretch4_mt_delta:
+    repo_id: olagh/stretch4_mt_delta
+    base: delta
+
+  pi05_stretch4_mt_velocity:
+    repo_id: olagh/stretch4_mt_vel
+    base: velocity
+  

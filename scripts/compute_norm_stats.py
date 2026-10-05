@@ -5,11 +5,16 @@ will compute the mean and standard deviation of the data in the dataset and save
 to the config assets directory.
 """
 
+import dataclasses
+import json
+import pathlib
+
 import numpy as np
 import tqdm
 import tyro
 
 import openpi.models.model as _model
+import openpi.policies.stretch_policy as stretch_policy
 import openpi.shared.normalize as normalize
 import openpi.training.config as _config
 import openpi.training.data_loader as _data_loader
@@ -88,6 +93,9 @@ def create_rlds_dataloader(
 
 def main(config_name: str, max_frames: int | None = None):
     config = _config.get_config(config_name)
+    if isinstance(config.data, _config.LeRobotStretch4DataConfig):
+        # This run makes the held_joints.json every other use of the config requires.
+        config = dataclasses.replace(config, data=dataclasses.replace(config.data, require_held=False))
     data_config = config.data.create(config.assets_dirs, config.model)
 
     if data_config.rlds_data_dir is not None:
@@ -109,8 +117,23 @@ def main(config_name: str, max_frames: int | None = None):
     norm_stats = {key: stats.get_statistics() for key, stats in stats.items()}
 
     output_path = config.assets_dirs / data_config.repo_id
+    held = None
+    if isinstance(config.data, _config.LeRobotStretch4DataConfig):
+        # Stretch 4: hold the joints the demos rarely moved and floor the stats, as every other
+        # Stretch 4 training path does (stretch_policy.finalize_norm_stats).
+        from lerobot.common.constants import HF_LEROBOT_HOME
+
+        d = config.data
+        norm_stats, held = stretch_policy.finalize_norm_stats(
+            pathlib.Path(HF_LEROBOT_HOME) / data_config.repo_id, norm_stats,
+            min_episode_frac=d.min_episode_frac, min_motion=d.min_motion, hold_joints=d.hold_joints,
+            keep_joints=d.keep_joints, auto_hold=d.auto_hold)
     print(f"Writing stats to: {output_path}")
     normalize.save(output_path, norm_stats)
+    if held is not None:
+        (pathlib.Path(output_path) / stretch_policy.HELD_FILE).write_text(json.dumps(held, indent=2))
+        print(f"Held joints: {', '.join(held['held_joints']) or 'none'} "
+              f"({pathlib.Path(output_path) / stretch_policy.HELD_FILE})")
 
 
 if __name__ == "__main__":

@@ -1,8 +1,14 @@
 import dataclasses
-from collections.abc import Sequence
+import json
+import pathlib
 
 import einops
 import numpy as np
+from stretch4_policy_recorder.common.columns import POSE_JOINTS
+from stretch4_policy_recorder.common.columns import check_state_names
+from stretch4_policy_recorder.common.held_joints import decide_held_joints
+from stretch4_policy_recorder.common.held_joints import format_hold_report
+from stretch4_policy_recorder.common.stats_floor import floor_stats
 
 from openpi import transforms
 from openpi.models import model as _model
@@ -32,8 +38,11 @@ class StretchInputs(transforms.DataTransformFn):
     """Maps Stretch 4 data (stretch4_policy_recorder, stretch4_to_lerobot --format v21) to the
     model input format.
 
-      observation/state (9):   [lift, arm, wrist_yaw, wrist_pitch, wrist_roll, grip_mm,
-                                base_vx, base_vy, base_omega];
+      observation/state (9):   [base_vx, base_vy, base_omega, lift, arm, wrist_yaw, wrist_pitch,
+                                wrist_roll, grip_mm] (stretch4_policy_recorder's
+                                POLICY_STATE_COLUMNS: the action's order, so state[i] and
+                                action[i] are the same quantity), plus grip_effort last (10)
+                                for a --grip-effort export.
       observation/base_pose:   [base_x, base_y, base_theta] (dataset observation.base_odom), only
                                for base="delta" training, as the anchor of the base targets
       actions (9):             the targets K frames ahead, [base_x, base_y, base_theta, lift, arm,
@@ -98,8 +107,8 @@ class StretchOutputs(transforms.DataTransformFn):
 
     # The 9 real action dims (base 3, lift, arm, wrist 3, gripper).
     action_dim: int = 9
-    # Held action dims (see StretchAbsoluteActions): sent to the client so it can hold them.
-    held: tuple[int, ...] = ()
+    # Held joint names (see held_joint_dims): sent to the client, which keeps them where they are.
+    held: tuple[str, ...] = ()
 
     def __call__(self, data: dict) -> dict:
         # The model pads actions to its internal width; only the first action_dim dims are real.
@@ -107,49 +116,103 @@ class StretchOutputs(transforms.DataTransformFn):
                 "stretch_held": list(self.held)}
 
 
-# Index layout shared by the transforms below.
+# Index layout shared by the transforms below. The state is in the action's order, so the same
+# index is the same quantity in both (the state may add grip_effort as a 10th value).
 #   action (9): [base_x|vx, base_y|vy, base_theta|omega, lift, arm, wrist_yaw, wrist_pitch,
 #                wrist_roll, grip_mm]
-#   state  (9): [lift, arm, wrist_yaw, wrist_pitch, wrist_roll, grip_mm, base_vx, base_vy, base_omega]
+#   state  (9): [base_vx, base_vy, base_omega, lift, arm, wrist_yaw, wrist_pitch, wrist_roll,
+#                grip_mm] (+ grip_effort)
 ACTION_BASE = slice(0, 3)
 ACTION_JOINTS = slice(3, 8)    # lift .. wrist_roll
 ACTION_GRIPPER = 8
-STATE_JOINTS = slice(0, 5)
-STATE_GRIPPER = 5
+STATE_JOINTS = ACTION_JOINTS
+STATE_GRIPPER = ACTION_GRIPPER
 
 BASE_MODES = ("delta", "velocity")
 GRIPPER_MODES = ("absolute", "relative")
 
-# Action dim names (for hold_joints and logs) and the state dim that carries each joint.
-ACTION_NAMES = ("base_x", "base_y", "base_theta", "lift", "arm", "wrist_yaw", "wrist_pitch",
-                "wrist_roll", "grip_mm")
-# maps each action index to the state index that holds the same joint.
-STATE_OF_ACTION = {3: 0, 4: 1, 5: 2, 6: 3, 7: 4, 8: 5}   # lift .. grip_mm
+# Written next to norm_stats.json by compute_norm_stats.py (finalize_norm_stats) and saved with
+# every checkpoint: the joints held still, decided as diffusion_policy and stretch4_fix_stats do.
+HELD_FILE = "held_joints.json"
 
 
-def held_action_dims(norm_stats, min_motion: float, hold_joints=()) -> tuple[tuple[int, ...], dict]:
-    """Action dims to hold still, and why: {dim: reason}.
-
-    A dim whose q01..q99 range in the action norm stats is below min_motion barely moved in
-    the demonstrations. Normalizing it divides by ~0 (openpi adds only 1e-6), so a tiny delta
-    becomes a huge training target and wrecks the loss. Such a dim is held: zeroed after normalization, 
-    and kept where it is at inference. The decision comes from the norm stats because they travel with
-    every checkpoint, so training and serving agree.
-    hold_joints (names in ACTION_NAMES) are held regardless.
-    """
-    unknown = set(hold_joints) - set(ACTION_NAMES)
+def held_joint_dims(held_names) -> tuple[int, ...]:
+    """Held joint names (lift .. grip_mm) -> their action dims (the same dims in the state)."""
+    unknown = [j for j in held_names if j not in POSE_JOINTS]
     if unknown:
-        raise ValueError(f"hold_joints {sorted(unknown)} are not action dims {ACTION_NAMES}")
-    reasons = {ACTION_NAMES.index(n): "hold_joints" for n in hold_joints}
-    stats = (norm_stats or {}).get("actions")
-    if stats is not None and min_motion > 0:
-        lo = np.asarray(stats.q01 if stats.q01 is not None else stats.mean - stats.std)
-        hi = np.asarray(stats.q99 if stats.q99 is not None else stats.mean + stats.std)
-        for dim in range(len(ACTION_NAMES)):
-            span = float(hi[dim] - lo[dim])
-            if span < min_motion and dim not in reasons:
-                reasons[dim] = f"q01-q99 range {span:.5f} < min_motion {min_motion}"
-    return tuple(sorted(reasons)), reasons
+        raise ValueError(f"held joints {unknown} are not joints {list(POSE_JOINTS)}")
+    return tuple(sorted(ACTION_JOINTS.start + POSE_JOINTS.index(j) for j in held_names))
+
+
+def load_held(assets_dir) -> dict | None:
+    """The held-joints record next to norm_stats.json in `assets_dir`, or None if there is none."""
+    path = pathlib.Path(assets_dir) / HELD_FILE
+    return json.loads(path.read_text()) if path.exists() else None
+
+
+def dataset_columns(root) -> tuple[dict, np.ndarray, np.ndarray]:
+    """A local LeRobot v2.1 dataset's ({feature: names}, absolute action rows, episode index).
+
+    Read straight from the parquet: holds are decided on the recorded absolute actions, as
+    diffusion_policy and stretch4_fix_stats decide them, not on the relative chunks the norm
+    stats describe."""
+    import pyarrow.parquet as pq
+
+    root = pathlib.Path(root)
+    info = json.loads((root / "meta" / "info.json").read_text())
+    names = {k: list(info["features"][k]["names"]) for k in ("observation.state", "action")}
+    problem = check_state_names(names["observation.state"], names["action"])
+    if problem:
+        raise ValueError(f"{root}: {problem}. Re-convert it with the current stretch4_to_lerobot "
+                         "--format v21.")
+    files = sorted((root / "data").glob("*/*.parquet"))
+    tables = [pq.read_table(f, columns=["action", "episode_index"]) for f in files]
+    action = np.concatenate([np.stack(t["action"].to_numpy(zero_copy_only=False)) for t in tables])
+    episode = np.concatenate([t["episode_index"].to_numpy() for t in tables])
+    return names, action.astype(np.float64), episode
+
+
+def finalize_norm_stats(dataset_root, norm_stats: dict, *, min_episode_frac=0.1, min_motion=None,
+                        hold_joints=(), keep_joints=(), auto_hold=True, verbose=True):
+    """The Stretch 4 steps after compute_norm_stats, as stretch4_fix_stats does them for LeRobot:
+
+    1. held joints (stretch4_policy_recorder.common.held_joints): a joint the demonstrations moved
+       in fewer than min_episode_frac of the episodes cannot be learned and wrecks normalization.
+       It is held: zeroed after normalization (StretchHoldJoints) and kept where it is by the
+       robot.
+    2. the stats floor (common.stats_floor): every state and action spread widened to at least its
+       floor, so a value the demos barely moved normalizes to ~0 instead of amplified noise, and a
+       reading slightly outside the training range does not become a huge input.
+
+    -> (floored norm stats, the held-joints record for HELD_FILE)."""
+    names, action, episode = dataset_columns(dataset_root)
+    change = np.nonzero(np.diff(episode))[0] + 1
+    ends = np.concatenate([change, [len(episode)]])
+    settings = {"min_episode_frac": float(min_episode_frac), "min_motion": dict(min_motion or {}),
+                "hold_joints": list(hold_joints), "keep_joints": list(keep_joints),
+                "auto_hold": bool(auto_hold)}
+    held, report = decide_held_joints(
+        action, names["action"], ends, episode_names=[f"episode {int(episode[e - 1])}" for e in ends],
+        min_episode_frac=min_episode_frac, min_motion=min_motion, hold_joints=list(hold_joints),
+        keep_joints=list(keep_joints), auto=auto_hold)
+    if verbose:
+        print(format_hold_report(report))
+
+    out, floored = dict(norm_stats), {}
+    for key, feature in (("state", "observation.state"), ("actions", "action")):
+        stats = out[key]
+        st = {k: np.asarray(getattr(stats, k)).tolist() for k in ("mean", "std", "q01", "q99")
+              if getattr(stats, k) is not None}
+        changed = floor_stats(st, names[feature][: len(st["mean"])])
+        if changed:
+            floored[key] = changed
+            if verbose:
+                print(f"[stretch] {key} stats floored: "
+                      + ", ".join(f"{n} ({'/'.join(c)})" for n, c in changed.items()))
+        out[key] = transforms.NormStats(**{k: np.asarray(v) for k, v in st.items()})
+    record = {"held_joints": held, "joints": report, "settings": settings, "floored": floored,
+              "state_names": names["observation.state"], "action_names": names["action"]}
+    return out, record
 
 
 def _wrap(angle):
@@ -213,16 +276,16 @@ class StretchHoldJoints(transforms.DataTransformFn):
     """Zero held joints in normalized space (model transforms, right after Normalize).
 
     The model sees 0 for a held joint's state and learns to predict 0 for its action, whatever
-    the raw values were. See held_action_dims."""
+    the raw values were: the same as pinning it to a constant. The state is in the action's
+    order, so the joint's state dim is its action dim. See finalize_norm_stats."""
 
     action_dims: tuple[int, ...] = ()
 
     def __call__(self, data: dict) -> dict:
         if not self.action_dims:
             return data
-        state_dims = [STATE_OF_ACTION[d] for d in self.action_dims if d in STATE_OF_ACTION]
         state = np.array(data["state"])
-        state[..., state_dims] = 0.0
+        state[..., list(self.action_dims)] = 0.0
         data["state"] = state
         if "actions" in data:
             actions = np.array(data["actions"])
@@ -242,7 +305,7 @@ class StretchAbsoluteActions(transforms.DataTransformFn):
     """
 
     gripper: str = "absolute"
-    # Held action dims (held_action_dims) come back as NaN: the server cannot know their current
+    # Held action dims (held_joint_dims) come back as NaN: the server cannot know their current
     # value (their state was zeroed in normalized space), so the robot client fills them from its
     # own observation. A client that does not know about holding fails on the NaN instead of
     # moving the joint somewhere wrong. StretchOutputs lists the held dims for the client.

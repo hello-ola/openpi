@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures as futures
 import dataclasses
+import json
 import logging
 from typing import Protocol
 
@@ -74,6 +75,9 @@ def save_state(
         norm_stats = data_config.norm_stats
         if norm_stats is not None and data_config.asset_id is not None:
             _normalize.save(directory / data_config.asset_id, norm_stats)
+            # Anything else serving must read as training used it (Stretch 4: held_joints.json).
+            for name, content in data_config.extra_assets.items():
+                (directory / data_config.asset_id / name).write_text(json.dumps(content, indent=2))
 
     # Split params that can be used for inference into a separate item.
     with at.disable_typechecking():

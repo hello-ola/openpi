@@ -33,10 +33,15 @@ DEFAULTS: dict[str, Any] = {
     "decay_lr": 5e-6,
     "save_interval": 1_000,
     "keep_period": 5_000,        # checkpoints kept permanently every N steps
-    # Held joints: any action dim whose q01..q99 range is below min_motion is held still
-    # (normalizing a near-constant dim wrecks training); hold_joints adds more by name.
-    "min_motion": 1e-3,
+    # Held joints, decided by compute_norm_stats.py as diffusion_policy and stretch4_fix_stats do
+    # (stretch4_policy_recorder.common.held_joints): a joint moved in fewer than min_episode_frac
+    # of the episodes is held still. min_motion: {joint: range that counts as moved} over the
+    # shared defaults; hold_joints always held, keep_joints never; auto_hold: false = hold_joints only.
+    "min_episode_frac": 0.1,
+    "min_motion": {},
     "hold_joints": [],
+    "keep_joints": [],
+    "auto_hold": True,
 }
 
 
@@ -64,6 +69,10 @@ def _load(path: pathlib.Path) -> dict[str, dict[str, Any]]:
         if unknown:
             raise ValueError(f"{path}: experiment {name!r} has unknown keys {sorted(unknown)}; "
                              f"allowed: {sorted(DEFAULTS)}")
+        if not isinstance(settings["min_motion"] or {}, dict):
+            raise ValueError(f"{path}: experiment {name!r}: min_motion is now per joint, e.g. "
+                             "{wrist_roll: 0.02} (the shared hold rule); a single number is the "
+                             "pre-conformance rule")
         if not settings["repo_id"]:
             raise ValueError(f"{path}: experiment {name!r} needs repo_id")
         out[name] = settings
@@ -97,8 +106,11 @@ def get_stretch4_configs():
                 head_cameras=heads,
                 base=s["base"],
                 gripper=s["gripper"],
-                min_motion=float(s["min_motion"]),
+                min_episode_frac=float(s["min_episode_frac"]),
+                min_motion={str(j): float(v) for j, v in (s["min_motion"] or {}).items()},
                 hold_joints=tuple(s["hold_joints"] or ()),
+                keep_joints=tuple(s["keep_joints"] or ()),
+                auto_hold=bool(s["auto_hold"]),
                 base_config=DataConfig(prompt_from_task=True, action_sequence_keys=("action",)),
             ),
             # Read by the robot client (stretch4_policy_recorder's openpi backend) to decode

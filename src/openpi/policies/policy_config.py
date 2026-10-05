@@ -55,7 +55,12 @@ def create_trained_policy(
         model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
     else:
         model = train_config.model.load(_model.restore_params(checkpoint_dir / "params", dtype=jnp.bfloat16))
-    data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
+    # The checkpoint's own assets when it has them (norm stats and anything saved beside them, e.g.
+    # Stretch 4's held joints), so the transforms match training even where the config's assets
+    # dir is missing or has been recomputed since.
+    assets_dir = pathlib.Path(checkpoint_dir) / "assets"
+    data_config = train_config.data.create(
+        assets_dir if assets_dir.is_dir() else train_config.assets_dirs, train_config.model)
     if norm_stats is None:
         # We are loading the norm stats from the checkpoint instead of the config assets dir to make sure
         # that the policy is using the same normalization stats as the original training process.

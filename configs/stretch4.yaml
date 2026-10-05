@@ -17,12 +17,17 @@
 #                    both). Or list them, in slot order: [head_left, head_right], [head_right]
 #   action_horizon   steps per chunk (30 = 1 s at 30 Hz)
 #   batch_size, num_train_steps, peak_lr, warmup_steps, decay_lr, save_interval, keep_period
-#   min_motion       default 0.001. Any action dim whose q01..q99 range in the norm stats is below
-#                    this (m / rad / mm) barely moved in the demos and is held still: the model
-#                    neither sees nor predicts it, and the robot keeps it where it is. Without this
-#                    a near-constant joint (wrist roll) normalizes to huge values and training
-#                    diverges. Training and serving log "Stretch 4: holding <joint>". 0 disables.
+#   Held joints: compute_norm_stats.py decides them exactly as diffusion_policy and
+#   stretch4_fix_stats do (stretch4_policy_recorder common/held_joints.py), prints the table, and
+#   writes held_joints.json next to norm_stats.json (saved in every checkpoint). A held joint is
+#   neither seen nor predicted by the model, and the robot keeps it where it is.
+#   min_episode_frac default 0.1: hold a joint moved in fewer than this fraction of the episodes
+#   min_motion       {joint: range}: within-episode range that counts as moved, over the shared
+#                    defaults (lift/arm 0.005 m, wrist 0.02 rad, grip_mm 1 mm)
 #   hold_joints      joints to hold regardless, e.g. [wrist_roll]
+#   keep_joints      joints never to hold
+#   auto_hold        false: hold only hold_joints
+#   compute_norm_stats.py also floors every spread (common/stats_floor.py).
 #
 # Changing base, gripper or action_horizon changes the training targets: recompute norm stats.
 

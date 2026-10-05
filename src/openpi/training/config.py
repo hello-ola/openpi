@@ -99,6 +99,10 @@ class DataConfig:
     # List of datasets to sample from: name, version, weight, and optionally filter_dict_path
     datasets: Sequence[droid_rlds_dataset.RLDSDataset] = ()
 
+    # More JSON files saved next to the norm stats in every checkpoint's assets, {filename: content}
+    # (Stretch 4: held_joints.json), so serving reads what training used.
+    extra_assets: dict[str, Any] = dataclasses.field(default_factory=dict)
+
 
 class GroupFactory(Protocol):
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
@@ -377,17 +381,14 @@ def stretch4_dataset_head_cameras(repo_id: str | None) -> tuple[str, ...] | None
     return heads
 
 
-# observation.state columns of a Stretch 4 dataset (stretch4_to_lerobot, schema v2).
-STRETCH4_STATE_NAMES = ["lift", "arm", "wrist_yaw", "wrist_pitch", "wrist_roll", "grip_mm",
-                        "base_vx", "base_vy", "base_omega"]
-
-
 @dataclasses.dataclass(frozen=True)
 class LeRobotStretch4DataConfig(DataConfigFactory):
     """Data pipeline for Stretch 4 datasets from stretch4_policy_recorder
     (stretch4_to_lerobot --format v21).
 
-      observation.state (9)      lift, arm, wrist_yaw/pitch/roll, grip_mm, base_vx/vy/omega
+      observation.state (9)      base_vx/vy/omega, lift, arm, wrist_yaw/pitch/roll, grip_mm: the
+                                 action's order (stretch4_policy_recorder's POLICY_STATE_COLUMNS),
+                                 plus grip_effort (10) for a --grip-effort export
       observation.base_odom (3)  base_x, base_y, base_theta: the anchor for base="delta" only
       action (9)                 targets K frames ahead: base displacement since episode start
                                  (with --base-action velocity: body-frame vx, vy, omega), joint
@@ -410,10 +411,19 @@ class LeRobotStretch4DataConfig(DataConfigFactory):
     head_cameras: tuple[str, ...] | None = None
     base: str = "delta"
     gripper: str = "absolute"
-    # Joints held still (stretch_policy.held_action_dims): any action dim whose q01..q99 range in
-    # the norm stats is below min_motion (m / rad / mm), plus hold_joints. 0 disables the automatic part.
-    min_motion: float = 1e-3
+    # Held joints, decided by compute_norm_stats.py exactly as diffusion_policy and stretch4_fix_stats
+    # decide them (stretch4_policy_recorder.common.held_joints): a joint moved in fewer than
+    # min_episode_frac of the episodes is held. min_motion: {joint: within-episode range that
+    # counts as moved} over the shared defaults. hold_joints are always held, keep_joints never;
+    # auto_hold=False holds only hold_joints. Saved as held_joints.json next to the norm stats.
+    min_episode_frac: float = 0.1
+    min_motion: dict[str, float] = dataclasses.field(default_factory=dict)
     hold_joints: tuple[str, ...] = ()
+    keep_joints: tuple[str, ...] = ()
+    auto_hold: bool = True
+    # compute_norm_stats.py sets this False: it computes the stats (and held_joints.json) that
+    # every other use requires.
+    require_held: bool = True
 
     def __post_init__(self):
         stretch_policy._check_modes(self.base, self.gripper)
@@ -444,11 +454,14 @@ class LeRobotStretch4DataConfig(DataConfigFactory):
         root = pathlib.Path(HF_LEROBOT_HOME) / repo_id
         info_path = root / "meta" / "info.json"
         if info_path.exists():
-            names = json.loads(info_path.read_text())["features"]["observation.state"].get("names")
-            if list(names or []) != STRETCH4_STATE_NAMES:
-                raise ValueError(
-                    f"{repo_id}: observation.state is {names}, expected {STRETCH4_STATE_NAMES} (no base "
-                    "pose). Re-convert it with the current stretch4_to_lerobot --format v21.")
+            from stretch4_policy_recorder.common.columns import check_state_names
+
+            features = json.loads(info_path.read_text())["features"]
+            problem = check_state_names(features["observation.state"].get("names") or [],
+                                        features["action"].get("names") or [])
+            if problem:
+                raise ValueError(f"{repo_id}: {problem}. Re-convert it with the current "
+                                 "stretch4_to_lerobot --format v21.")
         conv = root / "stretch_conversion.json"
         if conv.exists():
             info = json.loads(conv.read_text())
@@ -478,12 +491,18 @@ class LeRobotStretch4DataConfig(DataConfigFactory):
         if self.base == "delta":
             repack["observation/base_pose"] = "observation.base_odom"
 
-        # No norm stats yet (compute_norm_stats.py's first run): nothing to decide from, and the
-        # stats themselves are computed before any hold is applied.
-        held, reasons = stretch_policy.held_action_dims(base_config.norm_stats, self.min_motion,
-                                                        self.hold_joints)
-        for dim in held:
-            logging.info("Stretch 4: holding %s (%s)", stretch_policy.ACTION_NAMES[dim], reasons[dim])
+        # The held joints compute_norm_stats.py decided, next to the norm stats. None while the
+        # stats are being computed (they do not use the model transforms that hold joints).
+        assets_dir = epath.Path(self.assets.assets_dir or assets_dirs) / (base_config.asset_id or "")
+        record = stretch_policy.load_held(assets_dir) if base_config.norm_stats is not None else None
+        if record is None and self.require_held:
+            raise ValueError(
+                f"no {stretch_policy.HELD_FILE} in {assets_dir}: run scripts/compute_norm_stats.py "
+                "for this config (it decides the held joints and floors the stats).")
+        held_names = tuple((record or {}).get("held_joints") or {})
+        held = stretch_policy.held_joint_dims(held_names)
+        for joint in held_names:
+            logging.info("Stretch 4: holding %s (%s)", joint, record["held_joints"][joint].get("reason"))
 
         data_transforms = _transforms.Group(
             inputs=[
@@ -492,7 +511,7 @@ class LeRobotStretch4DataConfig(DataConfigFactory):
             ],
             outputs=[
                 stretch_policy.StretchAbsoluteActions(gripper=self.gripper, held=held),
-                stretch_policy.StretchOutputs(action_dim=9, held=held),
+                stretch_policy.StretchOutputs(action_dim=9, held=held_names),
             ],
         )
 
@@ -509,6 +528,7 @@ class LeRobotStretch4DataConfig(DataConfigFactory):
             repack_transforms=_transforms.Group(inputs=[_transforms.RepackTransform(repack)]),
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+            extra_assets={stretch_policy.HELD_FILE: record} if record is not None else {},
         )
 
 

@@ -77,6 +77,18 @@ def create_trained_policy(
         except ImportError:
             pytorch_device = "cpu"
 
+    metadata = dict(train_config.policy_metadata or {})
+    # Stretch 4: the state columns the checkpoint was trained on (its held-joints record), so the
+    # robot client refuses a state it would otherwise feed silently (grip_effort on or off).
+    if data_config.asset_id is not None:
+        held_file = pathlib.Path(checkpoint_dir) / "assets" / data_config.asset_id / "held_joints.json"
+        if held_file.exists():
+            from openpi.policies import stretch_policy
+
+            record = stretch_policy.load_held(held_file.parent) or {}
+            if record.get("state_names"):
+                metadata["stretch_state_names"] = list(record["state_names"])
+
     return _policy.Policy(
         model,
         transforms=[
@@ -93,7 +105,7 @@ def create_trained_policy(
             *repack_transforms.outputs,
         ],
         sample_kwargs=sample_kwargs,
-        metadata=train_config.policy_metadata,
+        metadata=metadata,
         is_pytorch=is_pytorch,
         pytorch_device=pytorch_device if is_pytorch else None,
     )
